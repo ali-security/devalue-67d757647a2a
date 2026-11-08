@@ -119,15 +119,88 @@ export default function devalue(value: any) {
 			case 'Date':
 				return `new Date(${thing.getTime()})`;
 
-			case 'Array':
+			case 'Array': {
+				// For dense arrays (no holes), we iterate normally.
+				// When we encounter the first hole, we collect own indices
+				// to determine the sparseness, then decide between:
+				//   - Array literal with holes: [,"a",,] (default)
+				//   - Object.assign with a sparse-safe allocator (for very sparse arrays)
+				// Only the Object.assign path avoids iterating every slot, which
+				// is what protects against the DoS of e.g. `arr[1000000] = 1`.
 				// Only own elements are emitted, matching what walk() visits —
 				// inherited array elements are neither read nor serialized
-				const members: string[] = [];
+				let hasHoles = false;
+
+				let result = '[';
+
 				for (let i = 0; i < thing.length; i += 1) {
-					members.push(Object.prototype.hasOwnProperty.call(thing, i) ? stringify(thing[i]) : '');
+					if (i > 0) result += ',';
+
+					if (Object.prototype.hasOwnProperty.call(thing, i)) {
+						result += stringify(thing[i]);
+					} else if (!hasHoles) {
+						// Decide between array literal and Object.assign.
+						//
+						// Array literal: holes are consecutive commas.
+						// For example, [, "a", ,] is written as [,"a",,].
+						// Each hole costs 1 char (a comma).
+						//
+						// Object.assign: populated indices are listed explicitly.
+						// For example, [, "a", ,] would be written as
+						// Object.assign(sparse(3),{1:"a"}), where sparse(n) stands
+						// for the expression emitted by stringifySparseArray(n).
+						// This avoids paying per-hole, but has a large fixed
+						// overhead for the allocator and Object.assign wrapper,
+						// and each element costs extra chars for its index and colon.
+						//
+						// The serialized values are the same size either way, so
+						// the choice comes down to the structural overhead:
+						//
+						//   Array literal overhead:
+						//     1 char per element or hole (comma separators)
+						//     + 2 chars for "[" and "]"
+						//     = L + 2
+						//
+						//   Object.assign overhead:
+						//     "Object.assign("      — 14 chars
+						//     + allocator expression — A chars
+						//     + ",{"                 — 2 chars
+						//     + for each populated element:
+						//       index + ":" + ","     — (d + 2) chars
+						//     + "})"                 — 2 chars
+						//     = (18 + A) + P * (d + 2)
+						//
+						// where L is the array length, P is the number of
+						// populated elements, A is the allocator expression's
+						// length, and d is the number of digits in L (an upper
+						// bound on the digits in any index).
+						//
+						// Object.assign is cheaper when:
+						//   (18 + A) + P * (d + 2) < L + 2
+						const populatedKeys = validArrayIndices(thing);
+						const population = populatedKeys.length;
+						const d = String(thing.length).length;
+						const array = stringifySparseArray(thing.length);
+
+						const holeCost = thing.length + 2;
+						const sparseCost = array.length + 18 + population * (d + 2);
+
+						if (holeCost > sparseCost) {
+							const entries = populatedKeys
+								.map(k => `${k}:${stringify(thing[k])}`)
+								.join(',');
+							return `Object.assign(${array},{${entries}})`;
+						}
+
+						hasHoles = true;
+					}
+					// else: already decided on array literal, hole is just an empty slot
+					// (the comma separator is all we need — no content for this position)
 				}
+
 				const tail = thing.length === 0 || Object.prototype.hasOwnProperty.call(thing, thing.length - 1) ? '' : ',';
-				return `[${members.join(',')}${tail}]`;
+				return result + tail + ']';
+			}
 
 			case 'Set':
 			case 'Map':
