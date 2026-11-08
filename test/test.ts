@@ -82,6 +82,213 @@ describe('devalue', () => {
 		test('String (repetition)', [str, str], `(function(a){return [a,a]}("a string"))`);
 	});
 
+	describe('sparse arrays', () => {
+		// the largest valid array index, i.e. an array of length 2 ** 32 - 1
+		const MAX_INDEX = 4294967294;
+
+		function evaluate(js: string): any {
+			return vm.runInThisContext(`(${js})`);
+		}
+
+		// the expression devalue emits to allocate a sparse array without
+		// eagerly allocating storage proportional to its length
+		function sparse(length: number) {
+			return `(function(a){a[${MAX_INDEX}]=0;delete a[${MAX_INDEX}];a.length=${length};return a}([]))`;
+		}
+
+		it('handles repeated very sparse arrays efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = 'x';
+
+			const start = Date.now();
+			const js = devalue([arr, arr]);
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `(function(a){a[${MAX_INDEX}]="x";return [a,a]}(${sparse(MAX_INDEX + 1)}))`);
+
+			const value = evaluate(js);
+			assert.equal(value[0], value[1]);
+			assert.equal(value[0].length, MAX_INDEX + 1);
+			assert.equal(value[0][MAX_INDEX], 'x');
+			assert.ok(!(0 in value[0]));
+		});
+
+		it('handles cyclical very sparse arrays efficiently', () => {
+			const arr: any[] = [];
+			arr[MAX_INDEX] = arr;
+
+			const start = Date.now();
+			const js = devalue(arr);
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 1000, `devalue took ${elapsed}ms, expected < 1000ms`);
+			assert.equal(js, `(function(a){a[${MAX_INDEX}]=a;return a}(${sparse(MAX_INDEX + 1)}))`);
+
+			const value = evaluate(js);
+			assert.equal(value.length, MAX_INDEX + 1);
+			assert.equal(value[MAX_INDEX], value);
+			assert.ok(!(0 in value));
+		});
+
+		it('preallocates short repeated arrays', () => {
+			const arr: any[] = [];
+			arr[33] = 'x';
+			assert.equal(devalue([arr, arr]), `(function(a){a[33]="x";return [a,a]}(Array(34)))`);
+
+			arr.length = 35;
+			assert.equal(devalue([arr, arr]), `(function(a){a[33]="x";return [a,a]}(${sparse(35)}))`);
+		});
+
+		// Arrays that are not repeated are emitted as array literals, so only
+		// the repeated ('empty', 'shared') and cyclic encodings are exercised
+		['empty', 'shared', 'cyclic'].forEach(kind => {
+			it(`does not scan sparse array holes (${kind})`, () => {
+				const length = 2 ** 32 - 1;
+				const index = length - 1;
+				const array: any[] = [];
+				array[index] = 42;
+				if (kind === 'empty') delete array[index];
+
+				// Count property probes rather than relying on wall-clock timings. This
+				// also bounds the work if either traversal regresses to scanning holes.
+				let probes = 0;
+				function probe() {
+					assert.ok(++probes <= 100, 'devalue should only inspect populated indices');
+				}
+
+				const proxy = new Proxy(array, {
+					get(target, key, receiver) {
+						probe();
+						return Reflect.get(target, key, receiver);
+					},
+					has(target, key) {
+						probe();
+						return Reflect.has(target, key);
+					},
+					getOwnPropertyDescriptor(target, key) {
+						probe();
+						return Reflect.getOwnPropertyDescriptor(target, key);
+					}
+				});
+
+				if (kind === 'cyclic') array[index] = proxy;
+
+				const js = devalue(kind === 'cyclic' ? proxy : [proxy, proxy]);
+				assert.ok(js.length < 150, `sparse output should stay compact: ${js}`);
+				const result = evaluate(js);
+				const restored = kind === 'cyclic' ? result : result[0];
+
+				assert.equal(restored.length, length);
+				assert.deepEqual(Object.keys(restored), kind === 'empty' ? [] : [String(index)]);
+				if (kind !== 'empty') {
+					assert.ok(restored[index] === (kind === 'cyclic' ? restored : 42));
+				}
+				if (kind !== 'cyclic') assert.ok(result[0] === result[1]);
+			});
+		});
+
+		[3, 1000].forEach(length => {
+			[false, true].forEach(shared => {
+				it(`ignores inherited array elements (length=${length}, shared=${shared})`, () => {
+					const proto = Object.create(Array.prototype);
+					[1, length - 1].forEach(index => {
+						Object.defineProperty(proto, String(index), {
+							enumerable: index === 1,
+							get() {
+								throw new Error('inherited array elements should not be read');
+							}
+						});
+					});
+					const array: any[] = [42];
+					array.length = length;
+					Object.setPrototypeOf(array, proto);
+
+					const result = evaluate(devalue(shared ? [array, array] : array));
+					const restored = shared ? result[0] : result;
+					assert.equal(restored.length, length);
+					assert.deepEqual(Object.keys(restored), ['0']);
+					assert.equal(restored[0], 42);
+					if (shared) assert.ok(result[0] === result[1]);
+				});
+			});
+		});
+
+		it('ignores non-index properties on shared arrays', () => {
+			const array: any[] = [42];
+			const keys: any[] = ['foo', '-1', '01', '1e0', '1.5', '4294967295', Symbol('key')];
+			keys.forEach(key => {
+				Object.defineProperty(array, key, {
+					enumerable: true,
+					get() {
+						throw new Error('non-index array properties should not be read');
+					}
+				});
+			});
+
+			const result = evaluate(devalue([array, array]));
+			assert.deepEqual(result, [[42], [42]]);
+			assert.ok(result[0] === result[1]);
+		});
+
+		it('throws for invalid sparse array elements', () => {
+			const array: any[] = [];
+			array[99999999] = () => {};
+			const root = { array };
+
+			assert.throws(() => devalue(root), /Cannot stringify a function/);
+		});
+
+		// Arrays that are not repeated are emitted as array literals, so every
+		// kind here goes through the repeated ('shared', 'holes') or cyclic encoding
+		['shared', 'cyclic', 'holes'].forEach(kind => {
+			it(`evaluates ${kind} sparse arrays without eager allocation`, () => {
+				// Eager allocation of 2500 arrays of length 1000000 would require ~20GB.
+				const length = 1000000;
+				const arrays: any[][] = [];
+				for (let i = 0; i < 2500; i += 1) {
+					// build the input without eagerly allocating it either: touching
+					// and deleting the largest valid index forces dictionary elements
+					const array: any[] = [];
+					array[MAX_INDEX] = 0;
+					delete array[MAX_INDEX];
+					array.length = length;
+					array[0] = 42;
+
+					if (kind === 'holes') {
+						delete array[0];
+					} else {
+						array[1] = kind === 'cyclic' ? array : undefined;
+					}
+
+					arrays.push(array);
+				}
+
+				const shared = kind !== 'cyclic';
+				const js = devalue(shared ? [arrays, arrays.slice()] : arrays);
+				const result = evaluate(js);
+				const restored = shared ? result[0] : result;
+				assert.equal(restored.length, arrays.length);
+
+				[0, arrays.length - 1].forEach(i => {
+					const array = restored[i];
+					assert.ok(array instanceof Array);
+					assert.equal(array.length, length);
+					assert.deepEqual(
+						Object.getOwnPropertyNames(array),
+						kind === 'holes' ? ['length'] : ['0', '1', 'length']
+					);
+					assert.ok(!(length - 1 in array));
+					if (kind !== 'holes') {
+						assert.equal(array[0], 42);
+						assert.ok(array[1] === (kind === 'cyclic' ? array : undefined));
+					}
+					if (shared) assert.ok(result[0][i] === result[1][i]);
+				});
+			});
+		});
+	});
+
 	describe('XSS', () => {
 		test(
 			'Dangerous string',

@@ -44,7 +44,10 @@ export default function devalue(value: any) {
 					return;
 
 				case 'Array':
-					thing.forEach(walk);
+					// Only visit populated indices — Array.prototype.forEach checks
+					// every slot up to thing.length, which is what makes very
+					// sparse arrays (e.g. `arr[1000000] = 1`) expensive to walk
+					validArrayIndices(thing).forEach(i => walk(thing[i]));
 					break;
 
 				case 'Set':
@@ -112,8 +115,13 @@ export default function devalue(value: any) {
 				return `new Date(${thing.getTime()})`;
 
 			case 'Array':
-				const members = thing.map((v: any, i: number) => i in thing ? stringify(v) : '');
-				const tail = thing.length === 0 || (thing.length - 1 in thing) ? '' : ',';
+				// Only own elements are emitted, matching what walk() visits —
+				// inherited array elements are neither read nor serialized
+				const members: string[] = [];
+				for (let i = 0; i < thing.length; i += 1) {
+					members.push(Object.prototype.hasOwnProperty.call(thing, i) ? stringify(thing[i]) : '');
+				}
+				const tail = thing.length === 0 || Object.prototype.hasOwnProperty.call(thing, thing.length - 1) ? '' : ',';
 				return `[${members.join(',')}${tail}]`;
 
 			case 'Set':
@@ -165,12 +173,22 @@ export default function devalue(value: any) {
 					values.push(`new Date(${thing.getTime()})`);
 					break;
 
-				case 'Array':
-					values.push(`Array(${thing.length})`);
-					thing.forEach((v: any, i: number) => {
-						statements.push(`${name}[${i}]=${stringify(v)}`);
+				case 'Array': {
+					const populatedKeys = validArrayIndices(thing);
+					// Only preallocate when the length is bounded by the number
+					// of populated elements, plus a small constant for short arrays.
+					values.push(
+						thing.length > 32 + 2 * populatedKeys.length
+							? stringifySparseArray(thing.length)
+							: `Array(${thing.length})`
+					);
+					// Only visit populated indices, so that very sparse arrays
+					// don't cost time proportional to thing.length
+					populatedKeys.forEach(i => {
+						statements.push(`${name}[${i}]=${stringify(thing[i])}`);
 					});
 					break;
+				}
 
 				case 'Set':
 					values.push(`new Set`);
@@ -224,6 +242,48 @@ function stringifyPrimitive(thing: any) {
 
 function getType(thing: any) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
+}
+
+function isValidArrayIndex(s: string) {
+	if (s.length === 0) return false;
+	if (s.length > 1 && s.charCodeAt(0) === 48) return false; // leading zero
+	for (let i = 0; i < s.length; i += 1) {
+		const c = s.charCodeAt(i);
+		if (c < 48 || c > 57) return false;
+	}
+	// by this point we know it's a string of digits, but it has to be within the range of valid array indices
+	const n = +s;
+	if (n >= 4294967295) return false; // 2 ** 32 - 1
+	if (n < 0) return false;
+	return true;
+}
+
+// Finds the populated indices of an array. Object.keys lists the
+// array indices first (in ascending order), followed by any
+// non-numeric properties, which are stripped from the result
+function validArrayIndices(array: any[]) {
+	const keys = Object.keys(array);
+	let i = keys.length - 1;
+	for (; i >= 0; i -= 1) {
+		if (isValidArrayIndex(keys[i])) {
+			break;
+		}
+	}
+	keys.length = i + 1;
+	return keys;
+}
+
+// the largest valid array index, i.e. 2 ** 32 - 2
+const MAX_ARRAY_INDEX = 4294967294;
+
+/**
+ * Emit an array whose storage is not proportional to its declared length.
+ * Touching and deleting the largest valid index forces V8 into
+ * dictionary-elements mode before setting the length.
+ * Merely starting with [] and assigning .length still eagerly allocates.
+ */
+function stringifySparseArray(length: number) {
+	return `(function(a){a[${MAX_ARRAY_INDEX}]=0;delete a[${MAX_ARRAY_INDEX}];a.length=${length};return a}([]))`;
 }
 
 function escapeUnsafeChar(c: string) {
