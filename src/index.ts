@@ -67,7 +67,12 @@ export default function devalue(value: any) {
 						throw new Error(`Cannot stringify POJOs with symbolic keys`);
 					}
 
-					Object.keys(thing).forEach(key => walk(thing[key]));
+					Object.keys(thing).forEach(key => {
+						if (key === '__proto__') {
+							throw new Error(`Cannot stringify objects with __proto__ keys`);
+						}
+						walk(thing[key]);
+					});
 			}
 		}
 	}

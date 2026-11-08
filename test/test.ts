@@ -118,5 +118,17 @@ describe('devalue', () => {
 		it('throws for symbolic keys', () => {
 			assert.throws(() => devalue({ [Symbol()]: null }));
 		});
+
+		it('throws for __proto__ keys', () => {
+			const inner = JSON.parse('{"__proto__":1}');
+			const root = { foo: inner };
+			assert.throws(
+				() => devalue(root),
+				(err: Error) => {
+					assert.equal(err.message, 'Cannot stringify objects with __proto__ keys');
+					return true;
+				}
+			);
+		});
 	});
 });
