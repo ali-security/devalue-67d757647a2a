@@ -82,6 +82,163 @@ describe('devalue', () => {
 		test('String (repetition)', [str, str], `(function(a){return [a,a]}("a string"))`);
 	});
 
+	describe('repeated primitives', () => {
+		function evaluate(js: string): any {
+			return vm.runInThisContext(`(${js})`);
+		}
+
+		const primitives: Array<[string, (n: number) => string]> = [
+			['string', n => 'x'.repeat(n)],
+			['escaped string', n => '</script>\n"\\\0\u2028\u2029'.repeat(n)]
+		];
+
+		primitives.forEach(([name, makePrimitive]) => {
+			it(`${name} output grows linearly when repeated`, () => {
+				let previousLength = 0;
+
+				[2000, 4000].forEach(n => {
+					const primitive = makePrimitive(n);
+					// a compact encoding of the same value references a single copy of the primitive
+					const encoded = JSON.stringify([Array(n).fill(1), primitive]);
+					const value = Array(n).fill(primitive);
+					const serialized = devalue(value);
+
+					assert.ok(serialized.length < encoded.length * 4, `output too large: ${serialized.length}`);
+					if (previousLength) assert.ok(serialized.length < previousLength * 2.1);
+					previousLength = serialized.length;
+
+					assert.deepStrictEqual(evaluate(serialized), value);
+					assert.ok(serialized.indexOf('<') === -1);
+				});
+			});
+
+			it(`${name} shared by distinct boxes stays compact`, () => {
+				const n = 2000;
+				const primitive = makePrimitive(n);
+				const value = Array.from({ length: n }, () => Object(primitive));
+				const serialized = devalue(value);
+
+				// a compact encoding stores the primitive once, plus a bounded cost per box
+				const encoded = JSON.stringify(primitive).length + 16 * n;
+				assert.ok(serialized.length < encoded * 4, `output too large: ${serialized.length}`);
+				assert.ok(serialized.indexOf('<') === -1);
+
+				const result = evaluate(serialized);
+				assert.equal(result.length, n);
+				assert.equal(new Set(result).size, n);
+				result.forEach((box: any) => {
+					assert.equal(typeof box, 'object');
+					assert.strictEqual(box.valueOf(), primitive);
+				});
+			});
+
+			it(`${name} preserves shared and distinct box identities`, () => {
+				const primitive = makePrimitive(256);
+				const box = Object(primitive);
+				const value = [box, box, primitive, primitive, Object(primitive)];
+				const result = evaluate(devalue(value));
+
+				assert.ok(result[0] === result[1]);
+				assert.equal(typeof result[0], 'object');
+				assert.strictEqual(result[0].valueOf(), primitive);
+				assert.strictEqual(result[2], primitive);
+				assert.strictEqual(result[3], primitive);
+				assert.equal(typeof result[4], 'object');
+				assert.strictEqual(result[4].valueOf(), primitive);
+				assert.equal(new Set([result[0], result[4]]).size, 2);
+			});
+
+			it(`${name} round-trips in shared and cyclic containers`, () => {
+				const primitive = makePrimitive(256);
+				const array = [primitive];
+				const map = new Map([[primitive, primitive]]);
+				const set = new Set([primitive]);
+				const box = Object(primitive);
+				const sparse: any[] = [];
+				sparse[1000] = primitive;
+				const value: any = Object.assign(Object.create(null), {
+					primitive,
+					array,
+					array_again: array,
+					map,
+					map_again: map,
+					set,
+					set_again: set,
+					box,
+					box_again: box,
+					sparse
+				});
+				value.self = value;
+
+				const result = evaluate(devalue(value));
+				assert.strictEqual(Object.getPrototypeOf(result), null);
+				assert.ok(result.self === result);
+				assert.strictEqual(result.primitive, primitive);
+				assert.ok(result.array === result.array_again);
+				assert.strictEqual(result.array[0], primitive);
+				assert.ok(result.map === result.map_again);
+				assert.strictEqual(result.map.get(primitive), primitive);
+				assert.ok(result.set === result.set_again);
+				assert.ok(result.set.has(primitive));
+				assert.ok(result.box === result.box_again);
+				assert.strictEqual(result.box.valueOf(), primitive);
+				assert.deepStrictEqual(result.sparse, sparse);
+			});
+		});
+
+		it('keeps repeated short strings compact', () => {
+			const value = Array(1000).fill('pending');
+			const serialized = devalue(value);
+
+			assert.ok(serialized.length <= JSON.stringify(value).length);
+			assert.deepStrictEqual(evaluate(serialized), value);
+		});
+
+		it('bounds expansion of repeated strings around 128 characters', () => {
+			[127, 128, 129].forEach(length => {
+				['x', '<'].forEach(character => {
+					const value = Array(2000).fill(character.repeat(length));
+					const serialized = devalue(value);
+
+					assert.deepStrictEqual(evaluate(serialized), value);
+					assert.ok(serialized.indexOf('<') === -1);
+					assert.ok(serialized.length < 6 * length + 3 * value.length);
+				});
+			});
+		});
+
+		it('preserves other primitives alongside hoisted values', () => {
+			const text = 'x'.repeat(256);
+			// 0 and -0 are deliberately not mixed here: repeated numbers are
+			// hoisted by SameValueZero, which is independent of this fix
+			const value = [
+				text,
+				text,
+				-0,
+				NaN,
+				NaN,
+				Infinity,
+				Infinity,
+				-Infinity,
+				-Infinity,
+				undefined,
+				undefined,
+				null,
+				null,
+				true,
+				true,
+				false,
+				false
+			];
+			const result = evaluate(devalue(value));
+
+			assert.equal(result.length, value.length);
+			for (let i = 0; i < value.length; i += 1) {
+				assert.ok(Object.is(result[i], value[i]), `mismatch at index ${i}`);
+			}
+		});
+	});
+
 	describe('sparse arrays', () => {
 		// the largest valid array index, i.e. an array of length 2 ** 32 - 1
 		const MAX_INDEX = 4294967294;

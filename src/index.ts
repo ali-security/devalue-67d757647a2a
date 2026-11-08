@@ -36,8 +36,13 @@ export default function devalue(value: any) {
 			const type = getType(thing);
 
 			switch (type) {
-				case 'Number':
 				case 'String':
+					// Count the boxed primitive, so that a long string shared by many
+					// distinct boxes is hoisted once instead of inlined for every box
+					walk(thing.valueOf());
+					return;
+
+				case 'Number':
 				case 'Boolean':
 				case 'Date':
 				case 'RegExp':
@@ -145,6 +150,7 @@ export default function devalue(value: any) {
 
 	if (names.size) {
 		const params: string[] = [];
+		const reconstructions: string[] = [];
 		const statements: string[] = [];
 		const values: string[] = [];
 
@@ -161,9 +167,18 @@ export default function devalue(value: any) {
 			switch (type) {
 				case 'Number':
 				case 'String':
-				case 'Boolean':
-					values.push(`Object(${stringify(thing.valueOf())})`);
+				case 'Boolean': {
+					const primitive = thing.valueOf();
+					if (names.has(primitive)) {
+						// A hoisted primitive is only in scope inside the IIFE, not in
+						// its arguments. Reconstruct the box before assigning references.
+						values.push('{}');
+						reconstructions.push(`${name}=Object(${stringify(primitive)})`);
+					} else {
+						values.push(`Object(${stringify(primitive)})`);
+					}
 					break;
+				}
 
 				case 'RegExp':
 					values.push(thing.toString());
@@ -210,7 +225,7 @@ export default function devalue(value: any) {
 
 		statements.push(`return ${str}`);
 
-		return `(function(${params.join(',')}){${statements.join(';')}}(${values.join(',')}))`
+		return `(function(${params.join(',')}){${reconstructions.concat(statements).join(';')}}(${values.join(',')}))`
 	} else {
 		return str;
 	}
